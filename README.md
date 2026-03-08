@@ -264,6 +264,14 @@ Upload a CSV of experiments and receive scored predictions in bulk with download
 
 ---
 
+## Tableau Dashboard
+
+An interactive Tableau dashboard provides additional visual analytics for the project:
+
+[View on Tableau Public](https://public.tableau.com/views/Roche_Capstone_Tableau/Dashboard1?:language=en-US&publish=yes&:sid=&:redirect=auth&:display_count=n&:origin=viz_share_link)
+
+---
+
 ## Notes
 
 - Data and model files are excluded from version control (see `.gitignore`). Re-run notebooks 01–04 in order to regenerate all artifacts.

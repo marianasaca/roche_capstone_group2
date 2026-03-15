@@ -228,7 +228,7 @@ def fmt_min_to_h(mins: float) -> str:
 
 
 # =========================================================
-# Load model + data
+# Load model + data (cached)
 # =========================================================
 for path, label in [
     (MODEL_PATH, "model_v3"),
@@ -240,10 +240,20 @@ for path, label in [
         st.error(f"Missing {label}: {path}")
         st.stop()
 
-model = joblib.load(MODEL_PATH)
-df_work = pd.read_csv(WORKFLOW_PATH)
-df_tel = pd.read_csv(TELEMETRY_PATH)
-df_rea = pd.read_csv(REAGENT_PATH)
+@st.cache_resource(show_spinner="Loading model...")
+def _load_model():
+    return joblib.load(MODEL_PATH)
+
+@st.cache_data(show_spinner="Loading data...")
+def _load_data():
+    return (
+        pd.read_csv(WORKFLOW_PATH),
+        pd.read_csv(TELEMETRY_PATH),
+        pd.read_csv(REAGENT_PATH),
+    )
+
+model = _load_model()
+df_work, df_tel, df_rea = _load_data()
 
 
 # =========================================================
@@ -307,76 +317,8 @@ model = patch_all_simple_imputers(model)
 
 
 # =========================================================
-# Telemetry aggregation (mean/max/std)
+# Telemetry aggregation + feature engineering (cached)
 # =========================================================
-df_tel["timestamp"] = pd.to_datetime(df_tel.get("timestamp", pd.NaT), errors="coerce")
-df_tel["ambient_temp"] = pd.to_numeric(df_tel.get("ambient_temp", np.nan), errors="coerce")
-
-tel_agg = df_tel.groupby("experiment_id").agg(
-    ambient_temp=("ambient_temp", "mean"),
-    ambient_temp_max=("ambient_temp", "max"),
-    ambient_temp_std=("ambient_temp", "std"),
-    telemetry_records=("timestamp", "count"),
-    tel_time_span_sec=("timestamp", lambda s: (s.max() - s.min()).total_seconds() if s.notna().any() else 0.0),
-).reset_index()
-tel_agg["ambient_temp_std"] = pd.to_numeric(tel_agg["ambient_temp_std"], errors="coerce").fillna(0.0)
-
-df = df_work.merge(tel_agg, on="experiment_id", how="left")
-for c in ["ambient_temp", "ambient_temp_max", "ambient_temp_std", "telemetry_records", "tel_time_span_sec"]:
-    df[c] = pd.to_numeric(df.get(c, 0.0), errors="coerce").fillna(0.0)
-
-# Reagent merge
-df = df.merge(
-    df_rea[["experiment_id", "reagent_batch_id"]].drop_duplicates("experiment_id"),
-    on="experiment_id", how="left"
-)
-df["reagent_batch_id"] = df["reagent_batch_id"].fillna("UNKNOWN")
-
-
-# =========================================================
-# Feature engineering
-# =========================================================
-df["booking_time"] = pd.to_datetime(df.get("booking_time", pd.NaT), errors="coerce")
-df["hour_of_day"] = df["booking_time"].dt.hour.fillna(9).astype(int)
-df["day_of_week"] = df["booking_time"].dt.dayofweek.fillna(0).astype(int)
-df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
-
-bt0 = df["booking_time"].min()
-df["days_since_start"] = 0.0 if pd.isna(bt0) else ((df["booking_time"] - bt0).dt.total_seconds() / 86400.0).fillna(0.0)
-
-df["scientist_workload"] = pd.to_numeric(df.get("scientist_workload", 0.0), errors="coerce").fillna(0.0)
-df["lab_occupancy_level"] = pd.to_numeric(df.get("lab_occupancy_level", 0.0), errors="coerce").fillna(0.0)
-df["stress_index"] = df["scientist_workload"] * df["lab_occupancy_level"]
-
-# ensure priority/queue exist
-if "priority" not in df.columns:
-    df["priority"] = "Normal"
-df["priority"] = df["priority"].astype(str).fillna("Normal")
-
-if "queue_length" not in df.columns:
-    df["queue_length"] = 0
-df["queue_length"] = pd.to_numeric(df["queue_length"], errors="coerce").fillna(0).astype(int)
-
-if "queue_wait_min" not in df.columns:
-    df["queue_wait_min"] = 0.0
-df["queue_wait_min"] = pd.to_numeric(df["queue_wait_min"], errors="coerce").fillna(0.0)
-
-# instrument_id still needed for model + queue wait calc
-if "instrument_id" not in df.columns:
-    df["instrument_id"] = "UNKNOWN"
-df["instrument_id"] = df["instrument_id"].astype(str).fillna("UNKNOWN")
-
-# Duration-to-queue ratio
-df["expected_duration"] = pd.to_numeric(df.get("expected_duration", 0), errors="coerce").fillna(0.0)
-df["duration_to_queue_ratio"] = df["expected_duration"] / (df["queue_length"] + 1)
-
-# Instrument cumulative hours (degradation proxy)
-df = df.sort_values("booking_time").reset_index(drop=True)
-df["instrument_cumulative_hours"] = df.groupby("instrument_id")["expected_duration"].cumsum() / 60.0
-
-# Instrument recent failure rate (rolling 30-day window)
-df["machine_failure"] = pd.to_numeric(df.get("machine_failure", 0), errors="coerce").fillna(0).astype(int)
-
 def _rolling_failure_rate(group, window_days=30):
     group = group.sort_values("booking_time")
     times = group["booking_time"].values
@@ -394,10 +336,77 @@ def _rolling_failure_rate(group, window_days=30):
         rates[i] = cum_fail / count if count > 0 else 0.0
     return pd.Series(rates, index=group.index)
 
-df["instrument_recent_failure_rate"] = (
-    df.groupby("instrument_id", group_keys=False)
-    .apply(_rolling_failure_rate)
-)
+@st.cache_data(show_spinner="Processing features...")
+def _build_df(_df_work, _df_tel, _df_rea):
+    _df_tel = _df_tel.copy()
+    _df_tel["timestamp"] = pd.to_datetime(_df_tel.get("timestamp", pd.NaT), errors="coerce")
+    _df_tel["ambient_temp"] = pd.to_numeric(_df_tel.get("ambient_temp", np.nan), errors="coerce")
+
+    tel_agg = _df_tel.groupby("experiment_id").agg(
+        ambient_temp=("ambient_temp", "mean"),
+        ambient_temp_max=("ambient_temp", "max"),
+        ambient_temp_std=("ambient_temp", "std"),
+        telemetry_records=("timestamp", "count"),
+        tel_time_span_sec=("timestamp", lambda s: (s.max() - s.min()).total_seconds() if s.notna().any() else 0.0),
+    ).reset_index()
+    tel_agg["ambient_temp_std"] = pd.to_numeric(tel_agg["ambient_temp_std"], errors="coerce").fillna(0.0)
+
+    df = _df_work.merge(tel_agg, on="experiment_id", how="left")
+    for c in ["ambient_temp", "ambient_temp_max", "ambient_temp_std", "telemetry_records", "tel_time_span_sec"]:
+        df[c] = pd.to_numeric(df.get(c, 0.0), errors="coerce").fillna(0.0)
+
+    # Reagent merge
+    df = df.merge(
+        _df_rea[["experiment_id", "reagent_batch_id"]].drop_duplicates("experiment_id"),
+        on="experiment_id", how="left"
+    )
+    df["reagent_batch_id"] = df["reagent_batch_id"].fillna("UNKNOWN")
+
+    # Feature engineering
+    df["booking_time"] = pd.to_datetime(df.get("booking_time", pd.NaT), errors="coerce")
+    df["hour_of_day"] = df["booking_time"].dt.hour.fillna(9).astype(int)
+    df["day_of_week"] = df["booking_time"].dt.dayofweek.fillna(0).astype(int)
+    df["is_weekend"]  = (df["day_of_week"] >= 5).astype(int)
+
+    bt0 = df["booking_time"].min()
+    df["days_since_start"] = 0.0 if pd.isna(bt0) else ((df["booking_time"] - bt0).dt.total_seconds() / 86400.0).fillna(0.0)
+
+    df["scientist_workload"] = pd.to_numeric(df.get("scientist_workload", 0.0), errors="coerce").fillna(0.0)
+    df["lab_occupancy_level"] = pd.to_numeric(df.get("lab_occupancy_level", 0.0), errors="coerce").fillna(0.0)
+    df["stress_index"] = df["scientist_workload"] * df["lab_occupancy_level"]
+
+    if "priority" not in df.columns:
+        df["priority"] = "Normal"
+    df["priority"] = df["priority"].astype(str).fillna("Normal")
+
+    if "queue_length" not in df.columns:
+        df["queue_length"] = 0
+    df["queue_length"] = pd.to_numeric(df["queue_length"], errors="coerce").fillna(0).astype(int)
+
+    if "queue_wait_min" not in df.columns:
+        df["queue_wait_min"] = 0.0
+    df["queue_wait_min"] = pd.to_numeric(df["queue_wait_min"], errors="coerce").fillna(0.0)
+
+    if "instrument_id" not in df.columns:
+        df["instrument_id"] = "UNKNOWN"
+    df["instrument_id"] = df["instrument_id"].astype(str).fillna("UNKNOWN")
+
+    df["expected_duration"] = pd.to_numeric(df.get("expected_duration", 0), errors="coerce").fillna(0.0)
+    df["duration_to_queue_ratio"] = df["expected_duration"] / (df["queue_length"] + 1)
+
+    df = df.sort_values("booking_time").reset_index(drop=True)
+    df["instrument_cumulative_hours"] = df.groupby("instrument_id")["expected_duration"].cumsum() / 60.0
+
+    df["machine_failure"] = pd.to_numeric(df.get("machine_failure", 0), errors="coerce").fillna(0).astype(int)
+
+    df["instrument_recent_failure_rate"] = (
+        df.groupby("instrument_id", group_keys=False)
+        .apply(_rolling_failure_rate, include_groups=False)
+    )
+
+    return df, tel_agg
+
+df, tel_agg = _build_df(df_work, df_tel, df_rea)
 
 
 # =========================================================
@@ -792,7 +801,7 @@ with st.sidebar:
     lab_occupancy_user = safe_slider("lab_occupancy_level", oc_lo, oc_hi, oc_mid, max(0.01, (oc_hi - oc_lo)/100.0))
 
     st.divider()
-    refresh = st.button("Refresh Importance", key="refresh_importance", use_container_width=True)
+    refresh = st.button("Refresh Importance", key="refresh_importance", width="stretch")
 
     if refresh or ("imp_df" not in st.session_state):
         try:
@@ -1140,7 +1149,7 @@ with tab_predict:
     colA, colB = st.columns([1.1, 0.9], gap="large")
 
     with colA:
-        st.plotly_chart(make_risk_gauge(risk, thr, amber), use_container_width=True)
+        st.plotly_chart(make_risk_gauge(risk, thr, amber), width="stretch")
 
         if queue_over:
             st.warning(
@@ -1172,11 +1181,11 @@ Thresholds — Green: &lt;{thr:.0%} · Amber: {thr:.0%}–{amber:.0%} · Red: &g
         st.markdown("#### Local Drivers (This Scenario)")
         st.dataframe(
             drivers_df.head(top_k)[["feature", "family", "driver_score", "current_value"]],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
     with right:
         st.markdown("#### Drivers by Family")
-        st.plotly_chart(make_local_drivers_bar(local_family), use_container_width=True)
+        st.plotly_chart(make_local_drivers_bar(local_family), width="stretch")
 
     st.divider()
 
@@ -1225,7 +1234,7 @@ Thresholds — Green: &lt;{thr:.0%} · Amber: {thr:.0%}–{amber:.0%} · Red: &g
         st.download_button(
             "Download Prediction as CSV",
             csv_buf.getvalue(), "prediction_export.csv", "text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     with tool_col2:
@@ -1236,7 +1245,7 @@ Thresholds — Green: &lt;{thr:.0%} · Amber: {thr:.0%}–{amber:.0%} · Red: &g
             missing_cnt = int((X_user_final.iloc[0].astype(str) == "MISSING").sum())
             nan_cnt = int(pd.isna(X_user_final.iloc[0]).sum())
             st.write("MISSING:", missing_cnt, "| NaN:", nan_cnt)
-            st.dataframe(X_user_final.T.head(120), use_container_width=True)
+            st.dataframe(X_user_final.T.head(120).astype(str), width="stretch")
 
 
 # =========================== TAB 2: ANALYTICS ===========================
@@ -1245,7 +1254,7 @@ with tab_analytics:
     st.caption(f"Scoring = {IMPORTANCE_SCORING}")
     show_imp = imp_df.head(30).copy()
     show_imp["importance"] = pd.to_numeric(show_imp["importance"], errors="coerce").fillna(0.0).round(6)
-    st.dataframe(show_imp[["feature", "importance", "family"]], use_container_width=True, hide_index=True)
+    st.dataframe(show_imp[["feature", "importance", "family"]], width="stretch", hide_index=True)
 
 
 # =========================== TAB 3: BATCH PREDICT ===========================
@@ -1326,11 +1335,11 @@ with tab_batch:
                 "instrument_id", "priority", "queue_length",
                 "queue_wait_p50_min", "queue_wait_p90_min"
             ]
-            st.dataframe(batch_df[show_cols].head(200), use_container_width=True, hide_index=True)
+            st.dataframe(batch_df[show_cols].head(200), width="stretch", hide_index=True)
 
             out_buf = io.StringIO()
             batch_df.to_csv(out_buf, index=False)
-            st.download_button("Download Results as CSV", out_buf.getvalue(), "batch_predictions.csv", "text/csv", use_container_width=True)
+            st.download_button("Download Results as CSV", out_buf.getvalue(), "batch_predictions.csv", "text/csv", width="stretch")
 
         except Exception as e:
             st.error(f"Error processing file: {e}")

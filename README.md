@@ -247,8 +247,6 @@ The model is tuned to favour **recall over precision** — in an operational lab
 
 ## Streamlit App
 
-**Live App:** [marianasaca-roche-capstone-group2-appapp-nrq64u.streamlit.app](https://marianasaca-roche-capstone-group2-appapp-nrq64u.streamlit.app/)
-
 The dashboard provides three tabs:
 
 ### Predict

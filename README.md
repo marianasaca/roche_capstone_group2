@@ -264,6 +264,12 @@ Upload a CSV of experiments and receive scored predictions in bulk with download
 
 ---
 
+## Poster
+
+[View Project Poster (PDF)](docs/Roche_Group2_Poster.pdf)
+
+---
+
 ## Tableau Dashboard
 
 An interactive Tableau dashboard provides additional visual analytics for the project:
